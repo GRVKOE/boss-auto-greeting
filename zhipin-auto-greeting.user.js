@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BOSS直聘自动沟通助手
 // @namespace    local.codex.zhipin
-// @version      0.1.9
-// @description  在 BOSS 直聘搜索结果页自动选择岗位、发送常用语或自定义问候语，并记录岗位数据。
+// @version      0.2.0
+// @description  在 BOSS 直聘搜索结果页自动选择岗位、发送常用语或自定义问候语，可选在常用语后投递图片，并记录岗位数据。
 // @match        https://www.zhipin.com/web/geek/jobs*
 // @match        https://www.zhipin.com/web/geek/chat*
 // @run-at       document-start
@@ -38,7 +38,7 @@
   // 全局常量：集中维护脚本版本、存储 key、BOSS 接口特征和默认问候语。
   const APP = {
     name: 'BOSS自动沟通',
-    version: '0.1.9',
+    version: '0.2.0',
     dbName: 'ZhipinAutoGreetingDB',
     dbVersion: 1,
     configKey: '__zhipin_auto_greeting_config__',
@@ -46,6 +46,10 @@
     debugEnabledKey: '__zhipin_auto_greeting_debug_enabled__',
     debugEventsKey: '__zhipin_auto_greeting_debug_events__',
     maxDebugEvents: 300,
+    // 投递图片在 IndexedDB settings 里的 key；图片体积大，不能塞进 localStorage 配置。
+    greetingImageKey: 'greetingImage',
+    // 允许的投递图片最大体积（字节），超出直接拒绝，避免写入过慢。
+    maxGreetingImageBytes: 8 * 1024 * 1024,
     jobListApiPattern: /\/wapi\/zpgeek\/(?:search\/joblist|pc\/(?:recommend|search)\/job\/list)\.json/i,
     jobDetailApiPattern: /\/wapi\/zpgeek\/job\/detail\.json/i,
     fastReplyUrl: '/wapi/zpchat/fastReply/userFastReplyList/get',
@@ -97,6 +101,8 @@
     fastReplies: [],
     textSource: 'text',
     customText: APP.defaultGreetingText,
+    // 常用语文本发送成功后，是否再自动投递一张图片（图片内容存于 IndexedDB）。
+    sendImageAfterGreeting: false,
     // 自定义接口配置：可从外部接口生成问候语，支持参数/请求头/请求体模板。
     customApiUrl: '',
     customApiMethod: 'GET',
@@ -2502,6 +2508,38 @@
     },
   };
 
+  // 投递图片存储：图片 Blob 直接放 IndexedDB 的 settings store，避免 localStorage 配额被大图撑爆。
+  const GreetingImageStore = {
+    // 保存用户选择的图片；覆盖写同一个 key，保证每个岗位发的是同一张图。
+    async save(file) {
+      await Database.put('settings', {
+        key: APP.greetingImageKey,
+        blob: file,
+        name: normalizeText(file.name) || 'greeting-image',
+        type: normalizeText(file.type) || 'image/png',
+        size: Number(file.size || 0),
+        updatedAt: nowIso(),
+      });
+      logDebugEvent('greeting_image_saved', { name: file.name, size: file.size, type: file.type });
+    },
+
+    // 读取已保存图片；未选择或读取失败返回 null。
+    async load() {
+      try {
+        const record = await Database.get('settings', APP.greetingImageKey);
+        return record && record.blob ? record : null;
+      } catch (_) {
+        return null;
+      }
+    },
+
+    // 删除已保存图片。
+    async clear() {
+      await Database.deleteWhere('settings', (record) => record && record.key === APP.greetingImageKey).catch(() => 0);
+      logDebugEvent('greeting_image_cleared', {});
+    },
+  };
+
   // 已沟通索引：用 Set 存岗位强 ID，避免每个岗位都扫 IndexedDB 或依赖页面按钮文本。
   // 页面上的“继续沟通”文案只能作为兜底判断，本地记录才是跨刷新、跨会话的主要依据。
   const ContactedIndex = {
@@ -2659,6 +2697,19 @@
                 <p class="za-hint">参数、请求头和请求体都支持 JSON 对象，也支持每行 key=value。</p>
               </div>
             </div>
+
+            <div class="za-image-send">
+              <label class="za-check"><input data-field="sendImageAfterGreeting" type="checkbox"> 常用语发送后投递图片</label>
+              <div class="za-inline">
+                <button type="button" data-action="pickGreetingImage">选择图片</button>
+                <button type="button" class="za-danger-soft" data-action="clearGreetingImage">清除</button>
+                <input data-role="greetingImageInput" type="file" accept="image/*" style="position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;pointer-events:none;">
+              </div>
+              <div class="za-image-preview" data-role="greetingImagePreview" hidden>
+                <img data-role="greetingImagePreviewImg" alt="投递图片预览">
+              </div>
+              <p class="za-hint" data-role="greetingImageHint">未选择图片；勾选后，每个岗位的常用语发送成功后会自动投递这张图。</p>
+            </div>
           </section>
 
           <section class="za-section" data-feature-section="strategy">
@@ -2815,6 +2866,10 @@
         listViewport: root.querySelector('[data-role="listViewport"]'),
         listSpacer: root.querySelector('[data-role="listSpacer"]'),
         listItems: root.querySelector('[data-role="listItems"]'),
+        greetingImageInput: root.querySelector('[data-role="greetingImageInput"]'),
+        greetingImagePreview: root.querySelector('[data-role="greetingImagePreview"]'),
+        greetingImagePreviewImg: root.querySelector('[data-role="greetingImagePreviewImg"]'),
+        greetingImageHint: root.querySelector('[data-role="greetingImageHint"]'),
         greetedRows: [],
         rowHeight: 66,
       };
@@ -2827,6 +2882,7 @@
       this.renderFastReplyOptions();
       this.renderCompanyBlacklistRules();
       this.renderBossActiveFilterOptions();
+      this.renderGreetingImagePreview();
       this.setFeaturePanelOpen(config.featurePanelOpen);
       this.setPanelOpen(config.panelOpen);
       this.scheduleConfigReapply();
@@ -2934,6 +2990,14 @@
           this.setCompanyBlacklistDropdownOpen(!this.isCompanyBlacklistDropdownOpen());
           return;
         }
+        if (action === 'pickGreetingImage') {
+          this.pickGreetingImage();
+          return;
+        }
+        if (action === 'clearGreetingImage') {
+          this.clearGreetingImage();
+          return;
+        }
         if (action !== 'stop') this.unlockStatus();
         if (action === 'toggle') this.setPanelOpen(!config.panelOpen);
         if (action === 'refreshFastReplies') FastReplyService.refresh(true);
@@ -2974,6 +3038,10 @@
       root.addEventListener('change', (event) => {
         if (event.target && event.target.dataset && event.target.dataset.role === 'debugLogEnabled') {
           DebugLogService.setEnabled(event.target.checked);
+          return;
+        }
+        if (event.target && event.target.dataset && event.target.dataset.role === 'greetingImageInput') {
+          this.handleGreetingImageSelected(event.target.files && event.target.files[0]);
           return;
         }
         if (this.shouldIgnoreConfigFieldEvent(event)) return;
@@ -3140,6 +3208,83 @@
       const key = field && field.dataset && field.dataset.field;
       if (!CONFIG_FIELD_KEY_SET.has(key)) return;
       this.setConfigFieldValue(field, config[key]);
+    },
+
+    // 触发隐藏的图片 file input，让用户手动选择一张本地图片。
+    pickGreetingImage() {
+      if (!runtime.ui || !runtime.ui.greetingImageInput) return;
+      this.unlockStatus();
+      runtime.ui.greetingImageInput.value = '';
+      runtime.ui.greetingImageInput.click();
+    },
+
+    // 用户选图后：类型/大小校验 → 写入 IndexedDB → 刷新预览与提示。
+    async handleGreetingImageSelected(file) {
+      if (!file) return;
+      if (!/^image\//.test(file.type || '')) {
+        this.setStatus('请选择图片文件', 'warn');
+        return;
+      }
+      if (file.size > APP.maxGreetingImageBytes) {
+        this.setStatus(`图片过大（${formatBytes(file.size)}），请选择小于 ${formatBytes(APP.maxGreetingImageBytes)} 的图片`, 'warn');
+        return;
+      }
+      try {
+        await GreetingImageStore.save(file);
+        await this.renderGreetingImagePreview();
+        this.setStatus(`已选择投递图片：${file.name}`, 'ok');
+      } catch (error) {
+        this.setStatus(`保存图片失败：${error.message || error}`, 'error');
+      }
+    },
+
+    // 清除已保存的投递图片和预览。
+    async clearGreetingImage() {
+      try {
+        await GreetingImageStore.clear();
+        await this.renderGreetingImagePreview();
+        this.setStatus('已清除投递图片', 'ok');
+      } catch (error) {
+        this.setStatus(`清除图片失败：${error.message || error}`, 'error');
+      }
+    },
+
+    // 读取已保存图片并渲染预览/提示；file input 本身不参与 localStorage 配置。
+    async renderGreetingImagePreview() {
+      if (!runtime.ui) return;
+      let asset = null;
+      try {
+        asset = await GreetingImageStore.load();
+      } catch (_) {
+        asset = null;
+      }
+
+      const hasImage = Boolean(asset && asset.blob);
+      const preview = runtime.ui.greetingImagePreview;
+      const img = runtime.ui.greetingImagePreviewImg;
+      const hint = runtime.ui.greetingImageHint;
+
+      if (preview && img) {
+        if (hasImage) {
+          if (runtime.greetingPreviewUrl) URL.revokeObjectURL(runtime.greetingPreviewUrl);
+          runtime.greetingPreviewUrl = URL.createObjectURL(asset.blob);
+          img.src = runtime.greetingPreviewUrl;
+          preview.hidden = false;
+        } else {
+          if (runtime.greetingPreviewUrl) {
+            URL.revokeObjectURL(runtime.greetingPreviewUrl);
+            runtime.greetingPreviewUrl = '';
+          }
+          img.removeAttribute('src');
+          preview.hidden = true;
+        }
+      }
+
+      if (hint) {
+        hint.textContent = hasImage
+          ? `已选择图片：${asset.name || '未命名'}（${formatBytes(asset.size || asset.blob.size || 0)}）。勾选后每个岗位都会投递这张图。`
+          : '未选择图片；勾选后，每个岗位的常用语发送成功后会自动投递这张图。';
+      }
     },
 
     // 判断板块管理选择区是否展开。
@@ -4061,6 +4206,7 @@
     },
 
     // 等待聊天页可用、写入消息、触发发送，并确认聊天记录中出现新消息。
+    // 文本确认发出后，如果开启了“常用语发送后投递图片”，再追加发送一张图片。
     async sendText(text, job, messageType) {
       const finalText = normalizeMessageText(text);
       if (!finalText) throw new Error('问候语文本为空');
@@ -4069,10 +4215,43 @@
       const beforeSend = await sendChatTextByEnter(finalText);
       await waitForMessageSent(finalText, beforeSend);
 
+      let imageSent = false;
+      if (config.sendImageAfterGreeting) {
+        imageSent = await this.sendImageAfterText(job);
+      }
+
       return {
         messageType: messageType || 'customText',
         messagePreview: finalText.slice(0, 120),
+        imageSent,
       };
+    },
+
+    // 文本发送成功后的图片投递；失败不改变“文本已发送”的事实，只记录告警。
+    async sendImageAfterText(job) {
+      const asset = await GreetingImageStore.load().catch(() => null);
+      if (!asset || !asset.blob) {
+        UI.setStatus('已开启投递图片，但还没有选择图片；本次只发文本', 'warn');
+        return false;
+      }
+
+      try {
+        UI.setStatus('文本已发送，正在投递图片...', 'info');
+        await sendChatImage(asset.blob, asset.name || asset.type);
+        logDebugEvent('greeting_image_sent', {
+          job: summarizeJobForDebug(job),
+          name: asset.name,
+          size: asset.size,
+        });
+        return true;
+      } catch (error) {
+        logDebugEvent('greeting_image_error', {
+          job: summarizeJobForDebug(job),
+          message: error && error.message || String(error),
+        }, 'warn');
+        UI.setStatus(`文本已发送，但图片投递失败：${error && error.message || error}`, 'warn');
+        return false;
+      }
     },
   };
 
@@ -4671,6 +4850,7 @@
           sentAt: nowIso(),
           messageType: sendResult.messageType,
           messagePreview: sendResult.messagePreview,
+          imageSent: Boolean(sendResult.imageSent),
           chatButtonText: state.chatButtonText,
           pageUrl: location.href,
         });
@@ -6751,6 +6931,111 @@
       attributeFilter: ['class', 'style', 'hidden'],
       pollInterval: 120,
     });
+  }
+
+  // 在聊天页定位接收图片的 file input；BOSS 一般会保留一个隐藏的 input[type=file]。
+  function findChatImageInput() {
+    const inputs = Array.from(document.querySelectorAll('input[type="file"]'))
+      .filter((element) => !isOwnUiElement(element));
+    if (!inputs.length) return null;
+
+    const imageInputs = inputs.filter((element) => /image/i.test(String(element.getAttribute('accept') || '')));
+    return imageInputs[0] || inputs.find((element) => {
+      const accept = String(element.getAttribute('accept') || '');
+      return !accept || /image|\.(?:png|jpe?g|gif|webp|bmp)/i.test(accept);
+    }) || inputs[0];
+  }
+
+  // 统计聊天区图片数量，作为图片消息发出后的粗略校验（排除头像和脚本自身 UI）。
+  function countConversationImages() {
+    const roots = Array.from(document.querySelectorAll([
+      '.chat-record',
+      '.chat-message-list',
+      '.chat-message',
+      '.chat-conversation',
+    ].join(','))).filter((element) => !isOwnUiElement(element) && isVisible(element));
+
+    let count = 0;
+    roots.forEach((root) => {
+      root.querySelectorAll('img').forEach((img) => {
+        if (!isVisible(img)) return;
+        const token = `${img.className || ''} ${img.getAttribute('src') || ''}`;
+        if (/avatar|head-img|user-img|portrait|emoji/i.test(token)) return;
+        const rect = img.getBoundingClientRect && img.getBoundingClientRect();
+        if (rect && (rect.width < 40 || rect.height < 40)) return;
+        count += 1;
+      });
+    });
+    return count;
+  }
+
+  // 兜底定位聊天页“图片/发送图片”按钮；只在找不到 file input 时使用。
+  function findChatImageTrigger() {
+    const keyword = /图片|照片|相册|发送图片|image|photo/i;
+    return Array.from(document.querySelectorAll('button, [role="button"], a, label, span, i'))
+      .find((element) => {
+        if (isOwnUiElement(element) || !isVisible(element)) return false;
+        const text = normalizeText(
+          element.getAttribute('aria-label') || element.getAttribute('title') || element.innerText || element.textContent || '',
+        );
+        return keyword.test(text);
+      }) || null;
+  }
+
+  // 把 Blob 包装成 File，写入 file input 后派发 change，触发页面自己的图片上传逻辑。
+  function attachFileToInput(input, blob, fileName) {
+    const name = fileName || 'greeting-image.png';
+    const type = blob.type || 'image/png';
+    const file = blob instanceof File ? blob : new File([blob], name, { type });
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(file);
+    input.files = dataTransfer.files;
+    input.dispatchEvent(createDomEvent('change', { bubbles: true }));
+    input.dispatchEvent(createInputEvent('input', { bubbles: true }));
+    return file;
+  }
+
+  // 在聊天页把图片发送出去：定位 input → 塞文件 → 等待聊天区出现新图片。
+  // 找不到上传入口直接抛错供面板提示；图片校验超时只告警，不影响文本已发送的结果。
+  async function sendChatImage(blob, fileName) {
+    const beforeCount = countConversationImages();
+
+    let input = await waitFor(() => findChatImageInput(), 3000, '图片上传输入框', {
+      observerRoot: getChatObserverRoot(),
+      childList: true,
+      subtree: true,
+      attributes: true,
+    }).catch(() => null);
+
+    if (!input) {
+      const trigger = findChatImageTrigger();
+      if (trigger) {
+        clickNative(trigger);
+        input = await waitFor(() => findChatImageInput(), getChatWaitTimeout(), '图片上传输入框', {
+          observerRoot: getChatObserverRoot(),
+          childList: true,
+          subtree: true,
+          attributes: true,
+        }).catch(() => null);
+      }
+    }
+
+    if (!input) throw new Error('未找到图片上传入口，请反馈聊天页截图');
+
+    attachFileToInput(input, blob, fileName);
+
+    await waitFor(() => countConversationImages() > beforeCount, getChatWaitTimeout(), '图片发送确认', {
+      observerRoot: getChatObserverRoot(),
+      childList: true,
+      subtree: true,
+      attributes: true,
+    }).catch(() => {
+      logDebugEvent('greeting_image_verify_timeout', {
+        beforeCount,
+        afterCount: countConversationImages(),
+      }, 'warn');
+    });
+    return true;
   }
 
   // 生成发送校验快照：目标 token 当前出现次数和“确认发送”次数。
@@ -9333,6 +9618,25 @@
       #zhipin-auto-greeting-root .za-fast-reply-preview[data-empty="true"] {
         color: var(--za-muted);
         background: #f8fafc;
+      }
+      #zhipin-auto-greeting-root .za-image-send {
+        margin-top: 10px;
+        padding-top: 10px;
+        border-top: 1px dashed var(--za-border);
+      }
+      #zhipin-auto-greeting-root .za-image-preview {
+        margin: 8px 0;
+        padding: 6px;
+        border: 1px solid var(--za-border);
+        border-radius: 6px;
+        background: #fbfcfd;
+        text-align: center;
+      }
+      #zhipin-auto-greeting-root .za-image-preview img {
+        max-width: 100%;
+        max-height: 160px;
+        border-radius: 4px;
+        display: inline-block;
       }
       #zhipin-auto-greeting-root .za-fast-reply-backdrop {
         position: fixed;
